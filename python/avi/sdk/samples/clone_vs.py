@@ -2013,8 +2013,8 @@ if __name__ == '__main__':
                                            (user, controller))
 
             if controller2:
-                if not args.tocloud and args.obj_type in ['vs', 'pool',
-                                                          'poolgroup']:
+                if (args.obj_type in ['vs', 'pool', 'poolgroup']
+                    and not args.tocloud):
                     raise Exception('Destination cloud should be specified '
                                     'when cloning %s to a different '
                                     'controller' % args.obj_type)
