@@ -357,9 +357,14 @@ class AviClone:
                 created_objs, warnings = self._process_sslkeyandcertificate(
                     ss_obj=old_obj, t_obj=t_obj, ot_obj=ot_obj,
                     oc_obj=oc_obj, force_clone=force_clone)
+            elif object_type =='certificatemanagementprofile':
+                (created_objs,
+                 warnings) = self._process_certificatemanagementprofile(
+                    cm_obj=old_obj, t_obj=t_obj, ot_obj=ot_obj,
+                    oc_obj=oc_obj, force_clone=force_clone)
 
-            # Try to create cloned object (possibly in a different tenant to the
-            # source object)
+            # Try to create cloned object (possibly in a different tenant to
+            # the source object)
 
             logger.debug('Creating %s "%s"...', object_type, new_name)
 
@@ -650,6 +655,40 @@ class AviClone:
                                           t_obj=t_obj, ot_obj=ot_obj,
                                           oc_obj=oc_obj,
                                           force_clone=force_clone)
+
+        except Exception as ex:
+            # If an exception occurred, delete any intermediate objects we
+            # have created
+
+            self._delete_created_objs(created_objs, ot_obj['uuid'])
+
+            raise
+
+        return created_objs, warnings
+
+    def _process_certificatemanagementprofile(self, cm_obj, t_obj,
+                                              ot_obj, oc_obj,
+                                              force_clone):
+        """
+        Performs certificatemanagementobject-specific manipulations on the 
+        cloned object
+        """
+
+        logger.debug('Running _process_certificatemanagementprofile')
+
+        created_objs = []
+        warnings = []
+
+        try:
+            if 'script_params' in cm_obj:
+                for par in cm_obj['script_params']:
+                    if par['is_sensitive']:
+                        par['value'] = 'dummy'
+                        warnings.append(
+                            'A sensitive script parameter (%s) in '
+                            'certificate management profile %s cannot '
+                            'be cloned and must be re-entered '
+                            'manually.' % (par['name'], cm_obj['name']))
 
         except Exception as ex:
             # If an exception occurred, delete any intermediate objects we
