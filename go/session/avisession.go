@@ -579,8 +579,6 @@ func (avisess *AviSession) restMultipartDownloadRequest(verb string, uri string,
 		return errorResult
 	}
 
-	defer resp.Body.Close()
-
 	errorResult.httpStatusCode = resp.StatusCode
 	avisess.collectCookiesFromResp(resp)
 	glog.Infof("Response code: %v", resp.StatusCode)
