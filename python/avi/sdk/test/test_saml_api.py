@@ -1,5 +1,4 @@
 import json
-
 import pytest
 import unittest
 from avi.sdk.avi_api import ApiSession
