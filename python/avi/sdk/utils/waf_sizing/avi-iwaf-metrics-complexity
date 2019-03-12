@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+
+from __future__ import print_function
+
+import argparse
+import json
+import logging
+import sys
+
+if sys.version_info[0:2] < (3,5):
+    sys.exit("ERROR: python 3.5 or newer required")
+
+try:
+    import requests
+except ImportError:
+    print("Please install required library 'request'.", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("pip3 install requests", file=sys.stderr)
+    sys.exit(1)
+
+
+import urllib3
+
+
+LOG=logging.getLogger(__name__)
+
+# default version
+VERSION = "17.2.12"
+
+# example data
+CONTROLLER = "http://10.151.20.94/api"
+USERNAME = "admin"
+VS_NAME = "WAF-DVWA-VS"
+
+BaseClass = object
+
+METRICS = [
+        # "l7_client.sum_total_responses",
+        # "l7_client.sum_waf_disabled",
+        # "l7_client.avg_waf_disabled",
+        # "l7_client.pct_waf_disabled",
+        # "l7_client.sum_http_headers_count",
+        "l7_client.avg_http_headers_count",
+        # "l7_client.sum_http_headers_bytes",
+        "l7_client.avg_http_headers_bytes",
+        # "l7_client.pct_get_reqs",
+        # "l7_client.pct_post_reqs",
+        # "l7_client.sum_http_params_count",
+        "l7_client.avg_http_params_count", 
+        # "l7_client.sum_uri_length",
+        "l7_client.avg_uri_length",
+        # "l7_client.sum_post_bytes",
+        "l7_client.avg_post_bytes"
+]
+
+LOW="L"
+MEDIUM="M"
+HIGH="H"
+
+AVG_HEADER_COUNT = "l7_client.avg_http_headers_count"
+AVG_HEADER_SIZE = "l7_client.avg_http_headers_bytes"
+AVG_PARAM_COUNT = "l7_client.avg_http_params_count"
+AVG_BODY_SIZE = "l7_client.avg_post_bytes" 
+AVG_URI_LENGTH = "l7_client.avg_uri_length"
+
+class Controller(BaseClass):
+    def __init__(self, url, username, password, version, unsecure=False):
+        self.prefix = url
+        self.username = username
+        self.password = password
+        self.verify = False if unsecure else True
+        self.headers = { "X-Avi-Version" : version }
+        self.tenant_uuid = None
+
+    def get(self, objClass, uuid = None, params=None):
+        if params is None:
+            params = {}
+        url = self.prefix
+        if self.tenant_uuid is not None:
+            url += "/tenant/" + self.tenant_uuid
+        url += "/" + objClass
+        if uuid is not  None:
+            url += "/" + uuid
+
+        response = requests.get(url, auth = (self.username, self.password), headers=self.headers, verify=self.verify, params=params)
+        response.raise_for_status()
+        data = response.json()
+        LOG.info("fetching {0} from {1}".format(objClass, url))
+        LOG.debug((url, params))
+        return data
+
+    def vs_list(self):
+        res = self.get("virtualservice")
+        for e in res["results"]:
+            yield VirtualService(self, e["uuid"], name=e["name"])
+
+
+class Tenant(BaseClass):
+    objClass = "tenant"
+    def __init__(self, controller, name):
+        self.controller = controller
+        self._uuid = None
+        self.name = name
+
+    @property
+    def uuid(self):
+        if self._uuid is None:
+            data = self.controller.get(self.objClass, params={'name': self.name})
+            results = data.get("results", [])
+            if results:
+                self._uuid = results[0].get("uuid")
+        return self._uuid
+
+
+class VirtualService(BaseClass):
+    objClass = "virtualservice"
+    def __init__(self, controller, uuid, name=None):
+        self.controller = controller
+        self.uuid = uuid
+        self._name = name
+
+    def _fetch_attributes(self):
+        data = self.controller.get(self.objClass, uuid=self.uuid)
+        self._name =  data["name"]
+
+    @property
+    def name(self):
+        if self._name is None:
+            self._fetch_attributes()
+        return self._name
+
+
+    @property
+    def metrics(self):
+        return VirtualServiceMetrics(self.controller, self.uuid)
+
+
+class VirtualServiceMetrics(BaseClass):
+    objClass = "analytics/anomaly/virtualservice"
+    objClass = "analytics/metrics/virtualservice"
+
+    def __init__(self, controller, uuid):
+        self.controller = controller
+        self.uuid = uuid
+
+
+    def data(self, metric=None):
+        if metric is not None:
+            res = self.controller.get(self.objClass, self.uuid, dict(step=60 * 60, limit=1*24, metric_id=metric))
+        else:
+            res = self.controller.get(self.objClass, self.uuid, dict(aggregation_windows=1, step=300, limit=288))
+        return res
+
+
+def get_data_from_controller(c, vs_name=None):
+    for vs in c.vs_list():
+        if vs_name is not None and vs.name != vs_name:
+            continue
+        res = {}
+        for metric in METRICS:
+            data = vs.metrics.data(metric)
+            metric_id = data["metric_id"]
+            for s in data["series"]:
+                values = []
+                for e in s["data"]:
+                    values.append((e.get("timestamp"), e.get("value")))
+                res.setdefault(metric_id, values)
+        return res
+    return None
+
+def join_data_by_timestamp(data):
+    res = {}
+    for metric_id, series in data.items():
+        for timestamp, value in series:
+            if timestamp:
+                res.setdefault(timestamp, {})[metric_id] = value
+    # fill empty values
+    for d in res.values():
+        for m in METRICS:
+            d.setdefault(m, 0)
+    return res
+
+
+def get_complexity_arguments(data):
+    if data[AVG_PARAM_COUNT] <= 2.7:
+        # 30% GET with 2, 70% POST with 3
+        return LOW
+    elif data[AVG_PARAM_COUNT] <= 3.5:
+        # 50% GET with 2, 50% POST with 5
+        return MEDIUM
+    return HIGH
+
+def get_complexity_headers(data):
+    if data[AVG_HEADER_COUNT] <= 5 and data[AVG_HEADER_SIZE] <= 1024:
+        return LOW
+    elif data[AVG_HEADER_COUNT] <= 7 and data[AVG_HEADER_SIZE] <= 2048:
+        return MEDIUM
+    return HIGH
+
+def get_complexity_request_size(data):
+    get_metric = data[AVG_HEADER_SIZE] + data[AVG_URI_LENGTH]
+    post_metric = get_metric + data[AVG_BODY_SIZE]
+    if get_metric <= 641 and post_metric <= 709:
+        return LOW
+    elif get_metric <= 682 and post_metric <= 750:
+        return MEDIUM
+    return HIGH
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Extract Avi iWAF complexity data.")
+    parser.add_argument("-u", "--user", "--username", dest="username", required=True, help="controller username")
+    parser.add_argument("-p", "--pass", "--password", dest="password", required=True, help="controller password")
+    parser.add_argument("-t", "--tenant", dest="tenant", default=None, help="The tenant. You need to have admin permissions to use this.")
+    parser.add_argument("--host", "--hostname", dest="hostname", required=True, help="Hostname or IP of controller")
+    parser.add_argument("--version", dest="version", default=VERSION, help="Avi API Version, default is {0}".format(VERSION))
+    parser.add_argument("--vs", "--vs-name", dest="vs_name", required=True, help="name of virtual service")
+    parser.add_argument("--unsecure", action="store_const", const=True, help="disable SSL certificate validation")
+    parser.add_argument("--no-dump", dest="create_dump_file", action="store_const", const=False, default=True, 
+                                     help="By default, this script will writes it output to a JSON file in the current directory. Set this flag to disable this")
+    args = parser.parse_args()
+
+
+    if args.unsecure:
+        urllib3.disable_warnings()
+    c = Controller("https://{0}/api".format(args.hostname), args.username, args.password, args.version, unsecure=args.unsecure)
+    try:
+        if args.tenant is not None:
+            c.tenant_uuid = Tenant(c, name=args.tenant).uuid
+        data = get_data_from_controller(c, vs_name=args.vs_name)
+    except requests.exceptions.ConnectionError as e:
+        LOG.error("can not connect to controller %s.\nError:\n\t%s", args.hostname, e)
+        sys.exit(1)
+    except requests.exceptions.HTTPError as e:
+        LOG.error("can not fetch data from controller %s.\nError:\n\t%s", args.hostname, e)
+        try:
+            if e.args[0].startswith("400 "):
+                LOG.error(
+                     "Explaination:\n"
+                     "\tAre you sure that your system does support at least API version {0}\n".format(VERSION))
+            elif e.args[0].startswith("401 "):
+                LOG.error(
+                      "Explaination:\n"
+                      "\tThis is an authentication problem. Please make sure that the provided\n"
+                      "\tusername and password are correct and that BasicAuth authentication\n"
+                      "\tis enabled on the controller.")
+        except (AttributeError, IndexError):
+            pass
+        sys.exit(1)
+    if data is None:
+        LOG.error("Can not fetch data for virtual service %s from controller %s.", args.vs_name, args.hostname)
+        sys.exit(1)
+    row_format = "{:>25} {:>10} {:>10} {:>10}"
+    tab_output = []
+    tab_output.append(("timestamp", "headers", "arguments", "request size"))
+    for ts, value in sorted(join_data_by_timestamp(data).items()):
+        tab_output.append((ts, 
+                           get_complexity_headers(value),
+                           get_complexity_arguments(value),
+                           get_complexity_request_size(value)))
+
+    # print table
+    for line in tab_output:
+        print(row_format.format(*line))
+
+    if args.create_dump_file:
+        # dump raw data to disk
+        if args.tenant:
+            dump_filename = "avi-iwaf-metrics-{0}-{1}-{2}.json".format(args.hostname, args.tenant, args.vs_name)
+        else:
+            dump_filename = "avi-iwaf-metrics-{0}-{1}.json".format(args.hostname, args.vs_name)
+        print("\nDumping raw metrics to {0}".format(dump_filename))
+        with open(dump_filename, "w") as fd:
+            fd.write(json.dumps({"tab_output": tab_output, "raw_data": data}, indent=4))
+
+
